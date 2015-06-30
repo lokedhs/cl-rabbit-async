@@ -1,9 +1,18 @@
 (in-package :cl-rabbit-async)
 
 (defun run-sync-loop (conn)
+  (log:info "Sleeping for 10 secs")
+  (sleep 10)
+  (log:info "After sleep")
+  #+nil(let ((q (cl-rabbit:queue-declare conn 1 :exclusive t :auto-delete t)))
+    (log:info "Test queue created: ~a" q))
   (loop
      repeat 3
-     for frame = (cl-rabbit::simple-wait-frame conn)
+     for frame = (progn
+                   (let ((data-p (cl-rabbit::data-in-buffer conn))
+                         (frames-p (cl-rabbit::frames-enqueued conn)))
+                     (log:info "Checking queue: data-p=~s, frames-p=~s" data-p frames-p))
+                   (cl-rabbit::simple-wait-frame conn))
      do (log:info "Got frame: ~s" frame)))
 
 (defun connect-test ()
