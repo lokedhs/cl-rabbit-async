@@ -1,5 +1,7 @@
 (in-package :cl-rabbit-async)
 
+(declaim (optimize (safety 3) (debug 3) (speed 0)))
+
 (defclass async-channel ()
   ((connection        :type async-connection
                       :initarg :connection
@@ -12,7 +14,10 @@
                       :accessor async-channel/message-callbacks)
    (close-callbacks   :type list
                       :initform nil
-                      :accessor async-channel/close-callbacks)))
+                      :accessor async-channel/close-callbacks)
+   (close-p           :type t
+                      :initform nil
+                      :accessor async-channel/close-p)))
 
 (defclass async-connection ()
   ((connection    :type cl-rabbit::connection
@@ -27,6 +32,11 @@
                   :reader async-connection/channels)
    (cmd-fd        :type fixnum
                   :accessor async-connection/cmd-fd)
+   (cmd-fd-reader :type fixnum
+                  :accessor async-connection/cmd-fd-reader)
+   (close-p       :type t
+                  :initform nil
+                  :accessor async-connection/close-p)
    (requests      :type list
                   :initform nil
                   :accessor async-connection/requests)
@@ -77,41 +87,53 @@
                 ;; ELSE: Message for unused channel
                 (warn-nonexistent-channel))))))))
 
-(defun handle-command (async-conn in-fd)
-  (sb-alien:with-alien ((buf (sb-alien:array sb-alien:int 1)))
-    (let* ((size (/ (sb-alien:alien-size sb-alien:int) 8))
-           (result (sb-posix:read in-fd (sb-alien:addr buf) size)))
-      (unless (= result size)
-        (error "Unable to read from pipe"))
-      (let ((index (sb-alien:deref buf 0)))
-        (let ((cmd (bordeaux-threads:with-lock-held ((async-connection/lock async-conn))
-                     (with-accessors ((requests async-connection/requests)) async-conn
-                       (let ((cmd (assoc index requests)))
-                         (unless cmd
-                           (error "Attempt to get missing command index: ~s" index))
-                         (setf requests (delete (car cmd) requests :key #'car))
-                         (cdr cmd))))))
-          (let ((result (funcall (first cmd))))
-            (funcall (second cmd) result)))))))
+(defun handle-command (async-conn)
+  (let ((in-fd (async-connection/cmd-fd-reader async-conn)))
+    (sb-alien:with-alien ((buf (sb-alien:array sb-alien:int 1)))
+      (let* ((size (/ (sb-alien:alien-size sb-alien:int) 8))
+             (result (sb-posix:read in-fd (sb-alien:addr buf) size)))
+        (unless (= result size)
+          (error "Unable to read from pipe"))
+        (let ((index (sb-alien:deref buf 0)))
+          (let ((cmd (bordeaux-threads:with-lock-held ((async-connection/lock async-conn))
+                       (with-accessors ((requests async-connection/requests)) async-conn
+                         (let ((cmd (assoc index requests)))
+                           (unless cmd
+                             (error "Attempt to get missing command index: ~s" index))
+                           (setf requests (delete (car cmd) requests :key #'car))
+                           (cdr cmd))))))
+            (let ((result (funcall (first cmd))))
+              (funcall (second cmd) result))))))))
 
-(defun run-sync-loop (async-conn in-fd)
-  (let ((socket-fd (cl-rabbit::get-sockfd (async-connection/connection async-conn))))
+(defun wait-select (async-conn)
+  (let* ((conn (async-connection/connection async-conn))
+         (socket-fd (cl-rabbit::get-sockfd conn))
+         (in-fd (async-connection/cmd-fd-reader async-conn)))
     (sb-alien:with-alien ((rfds (sb-alien:struct sb-unix:fd-set)))
       (sb-unix:fd-zero rfds)
-      (sb-unix:fd-set socket-fd rfds)
-      (sb-unix:fd-set in-fd rfds)
+      (locally
+          (declare (optimize (debug 3) (safety 3) (speed 0)))
+        (sb-unix:fd-set socket-fd rfds)
+        (sb-unix:fd-set in-fd rfds))
       (multiple-value-bind (count err)
           (sb-unix:unix-fast-select (1+ (max socket-fd in-fd)) (sb-alien:addr rfds) nil nil 10 0)
         (if count
             (progn
               (when (sb-unix:fd-isset in-fd rfds)
-                (handle-command async-conn in-fd))
+                (handle-command async-conn))
               (when (sb-unix:fd-isset socket-fd rfds)
                 (wait-for-frame async-conn)))
             ;; ELSE: An error occurred in the call
             (unless (= err sb-unix:eintr)
-              (error "Error: ~s" err)))))
-    (log:info "Sync loop for fd ~a finished" socket-fd)))
+              (error "Error: ~s" err)))))))
+
+(defun run-sync-loop (async-conn)
+  (let ((conn (async-connection/connection async-conn)))
+    (loop
+       if (or (cl-rabbit::data-in-buffer conn)
+              (cl-rabbit::frames-enqueued conn))
+       do (wait-for-frame async-conn)
+       else do (wait-select async-conn))))
 
 (defun run-in-sync-thread (async-conn fn)
   (let* ((h (make-transfer-handler))
@@ -128,18 +150,33 @@
                       (/ (sb-alien:alien-size sb-alien:int) 8)))
     (wait-for-value h)))
 
+(defmacro with-sync (conn &body body)
+  `(run-in-sync-thread ,conn (lambda () ,@body)))
+
 (defun open-channel (async-conn)
-  (run-in-sync-thread async-conn
-                      (lambda ()
-                        (let* ((index (find-free-channel-index async-conn))
-                               (channel (1+ index)))
-                          (cl-rabbit:channel-open (async-connection/connection async-conn) channel)
-                          (log:info "Opened channel: ~s" index)
-                          (let ((async-channel (make-instance 'async-channel
-                                                              :connection async-conn
-                                                              :channel channel)))
-                            (setf (aref (async-connection/channels async-conn) index) async-channel)
-                            async-channel)))))
+  (with-sync async-conn
+    (let* ((index (find-free-channel-index async-conn))
+           (channel (1+ index)))
+      (cl-rabbit:channel-open (async-connection/connection async-conn) channel)
+      (log:info "Opened channel: ~s" index)
+      (let ((async-channel (make-instance 'async-channel
+                                          :connection async-conn
+                                          :channel channel)))
+        (setf (aref (async-connection/channels async-conn) index) async-channel)
+        async-channel))))
+
+(defun close-channel (async-channel)
+  (when (async-channel/close-p async-channel)
+    (error "Channel is already closed"))
+  (let ((async-conn (async-channel/connection async-channel)))
+    (with-sync async-conn
+      (cl-rabbit:channel-close (async-connection/connection async-conn) (async-channel/channel async-channel))
+      (setf (async-channel/close-p async-channel) t)
+      (let ((channels (async-connection/channels async-conn))
+            (index (1- (async-channel/channel async-channel))))
+        (assert (not (null (aref channels index))))
+        (setf (aref channels index) nil))
+      nil)))
 
 (defun make-async-connection ()
   (let* ((conn (cl-rabbit:new-connection))
@@ -150,13 +187,23 @@
       (trivial-garbage:finalize conn-wrapper
                                 (lambda ()
                                   (log:warn "Reference to RabbitMQ connection object lost. Closing.")
-                                  (cl-rabbit:destroy-connection conn)))
+                                  #+nil(cl-rabbit:destroy-connection conn)))
       (multiple-value-bind (in-fd out-fd)
           (sb-posix:pipe)
         (setf (async-connection/cmd-fd conn-wrapper) out-fd)
-        (bordeaux-threads:make-thread (lambda () (run-sync-loop conn-wrapper in-fd))
+        (setf (async-connection/cmd-fd-reader conn-wrapper) in-fd)
+        (bordeaux-threads:make-thread (lambda () (run-sync-loop conn-wrapper))
                                       :name "RabbitMQ listener")
         conn-wrapper))))
+
+(defun close-async-connection (async-conn)
+  (when (async-connection/close-p async-conn)
+    (error "Connection is already closed"))
+  (setf (async-connection/close-p async-conn) t)
+  (sb-posix:close (async-connection/cmd-fd async-conn))
+  (sb-posix:close (async-connection/cmd-fd-reader async-conn))
+  (with-sync async-conn
+    (cl-rabbit:destroy-connection (async-connection/connection async-conn))))
 
 #+nil(defun connect-test ()
   (cl-rabbit:with-connection (conn)
