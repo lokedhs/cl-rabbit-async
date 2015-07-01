@@ -10,9 +10,11 @@
                       :initarg :channel
                       :reader async-channel/channel)
    (message-callbacks :type list
+                      :initarg :message-callbacks
                       :initform nil
                       :accessor async-channel/message-callbacks)
    (close-callbacks   :type list
+                      :initarg :close-callbacks
                       :initform nil
                       :accessor async-channel/close-callbacks)
    (close-p           :type t
@@ -48,7 +50,7 @@
                   :reader async-connection/lock)))
 
 (defun process-unexpected-frame (conn)
-  (cl-rabbit::simple-wait-frame conn))
+  (simple-wait-frame conn))
 
 (defun find-free-channel-index (async-conn)
   (with-accessors ((channels async-connection/channels))
@@ -73,12 +75,12 @@
                         (process-unexpected-frame conn)))))
       ;;
       (let ((envelope (cl-rabbit:consume-message conn)))
-        (log:info "Got message: ~s" envelope)
-        (let ((channel-id (cl-rabbit:envelope/channel envelope)))
+        (let* ((channel-id (cl-rabbit:envelope/channel envelope))
+               (index (1- channel-id)))
           (labels ((warn-nonexistent-channel ()
                      (log:warn "Message received for closed channel: ~a" channel-id)))
-            (if (< channel-id (length channels))
-                (let ((async-channel (aref channels channel-id)))
+            (if (< index (length channels))
+                (let ((async-channel (aref channels index)))
                   (if async-channel
                       (dolist (callback (async-channel/message-callbacks async-channel))
                         (funcall callback envelope))
@@ -153,31 +155,6 @@
 (defmacro with-sync (conn &body body)
   `(run-in-sync-thread ,conn (lambda () ,@body)))
 
-(defun open-channel (async-conn)
-  (with-sync async-conn
-    (let* ((index (find-free-channel-index async-conn))
-           (channel (1+ index)))
-      (cl-rabbit:channel-open (async-connection/connection async-conn) channel)
-      (log:info "Opened channel: ~s" index)
-      (let ((async-channel (make-instance 'async-channel
-                                          :connection async-conn
-                                          :channel channel)))
-        (setf (aref (async-connection/channels async-conn) index) async-channel)
-        async-channel))))
-
-(defun close-channel (async-channel)
-  (when (async-channel/close-p async-channel)
-    (error "Channel is already closed"))
-  (let ((async-conn (async-channel/connection async-channel)))
-    (with-sync async-conn
-      (cl-rabbit:channel-close (async-connection/connection async-conn) (async-channel/channel async-channel))
-      (setf (async-channel/close-p async-channel) t)
-      (let ((channels (async-connection/channels async-conn))
-            (index (1- (async-channel/channel async-channel))))
-        (assert (not (null (aref channels index))))
-        (setf (aref channels index) nil))
-      nil)))
-
 (defun make-async-connection ()
   (let* ((conn (cl-rabbit:new-connection))
          (socket (cl-rabbit:tcp-socket-new conn)))
@@ -205,14 +182,51 @@
   (with-sync async-conn
     (cl-rabbit:destroy-connection (async-connection/connection async-conn))))
 
-#+nil(defun connect-test ()
-  (cl-rabbit:with-connection (conn)
-    (let ((socket (cl-rabbit:tcp-socket-new conn)))
-      (cl-rabbit:socket-open socket "localhost" 5672)
-      (cl-rabbit:login-sasl-plain conn "/" "guest" "guest")
-      (cl-rabbit:channel-open conn 1)
-      (let ((q (cl-rabbit:queue-declare conn 1 :exclusive t :auto-delete t)))
-        (cl-rabbit:queue-bind conn 1 :queue q :exchange "test-ex" :routing-key "xx")
-        (let ((ctag (cl-rabbit:basic-consume conn 1 q)))
-          (log:info "Waiting for messages. Consume tag: ~s" ctag)
-          (run-sync-loop conn))))))
+(defun open-channel (async-conn &key message-callback close-callback)
+  (with-sync async-conn
+    (let* ((index (find-free-channel-index async-conn))
+           (channel (1+ index)))
+      (cl-rabbit:channel-open (async-connection/connection async-conn) channel)
+      (log:info "Opened channel: ~s" channel)
+      (let ((async-channel (make-instance 'async-channel
+                                          :connection async-conn
+                                          :channel channel
+                                          :message-callbacks (if message-callback (list message-callback) nil)
+                                          :close-callbacks (if close-callback (list close-callback) nil))))
+        (setf (aref (async-connection/channels async-conn) index) async-channel)
+        async-channel))))
+
+(defun close-channel (async-channel &key code)
+  (when (async-channel/close-p async-channel)
+    (error "Channel is already closed"))
+  (let ((async-conn (async-channel/connection async-channel)))
+    (with-sync async-conn
+      (cl-rabbit:channel-close (async-connection/connection async-conn) (async-channel/channel async-channel)
+                               :code code)
+      (setf (async-channel/close-p async-channel) t)
+      (let ((channels (async-connection/channels async-conn))
+            (index (1- (async-channel/channel async-channel))))
+        (assert (not (null (aref channels index))))
+        (setf (aref channels index) nil))
+      nil)))
+
+(defmacro mkwrap (async-name name args keys)
+  `(defun ,async-name (async-channel ,@args ,@(if keys `(&key ,@keys) nil))
+     (let ((async-conn (async-channel/connection async-channel)))
+       (with-sync async-conn
+         (,name (async-connection/connection async-conn)
+                (async-channel/channel async-channel)
+                ,@args ,@(mapcan (lambda (key)
+                                   (list (intern (symbol-name key) "KEYWORD") key))
+                                 keys))))))
+
+(mkwrap async-exchange-declare cl-rabbit:exchange-declare (exchange type) (passive durable auto-delete internal arguments))
+(mkwrap async-exchange-delete cl-rabbit:exchange-delete (exchange) (if-unused))
+(mkwrap async-exchange-unbind cl-rabbit:exchange-unbind () (destination source routing-key))
+(mkwrap async-exchange-bind cl-rabbit:exchange-bind () (destination source routing-key arguments))
+(mkwrap async-queue-declare cl-rabbit:queue-declare () (queue passive durable exclusive auto-delete arguments))
+(mkwrap async-queue-bind cl-rabbit:queue-bind () (queue exchange routing-key arguments))
+(mkwrap async-queue-unbind cl-rabbit:queue-unbind () (queue exchange routing-key arguments))
+(mkwrap async-queue-purge cl-rabbit:queue-purge (queue) ())
+(mkwrap async-queue-delete cl-rabbit:queue-delete (queue) (if-unused if-empty))
+(mkwrap async-basic-consume cl-rabbit:basic-consume (queue) (consumer-tag no-local no-ack exclusive arguments))

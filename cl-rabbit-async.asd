@@ -10,4 +10,5 @@
                         :serial t
                         :components ((:file "package")
                                      (:file "misc")
+                                     (:file "amqp-misc")
                                      (:file "cl-rabbit-async")))))
