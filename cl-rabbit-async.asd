@@ -4,8 +4,10 @@
   :license "MIT"
   :description "Experimental async version of cl-rabbit"
   :depends-on (:cl-rabbit
-               :log4cl)
+               :log4cl
+               :trivial-garbage)
   :components ((:module src
                         :serial t
                         :components ((:file "package")
+                                     (:file "misc")
                                      (:file "cl-rabbit-async")))))
