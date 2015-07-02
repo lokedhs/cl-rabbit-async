@@ -217,7 +217,8 @@
          (,name (async-connection/connection async-conn)
                 (async-channel/channel async-channel)
                 ,@args ,@(mapcan (lambda (key)
-                                   (list (intern (symbol-name key) "KEYWORD") key))
+                                   (let ((key-name (if (listp key) (car key) key)))
+                                     (list (intern (symbol-name key-name) "KEYWORD") key-name)))
                                  keys))))))
 
 (mkwrap async-exchange-declare cl-rabbit:exchange-declare (exchange type) (passive durable auto-delete internal arguments))
@@ -230,3 +231,15 @@
 (mkwrap async-queue-purge cl-rabbit:queue-purge (queue) ())
 (mkwrap async-queue-delete cl-rabbit:queue-delete (queue) (if-unused if-empty))
 (mkwrap async-basic-consume cl-rabbit:basic-consume (queue) (consumer-tag no-local no-ack exclusive arguments))
+(mkwrap async-basic-publish cl-rabbit:basic-publish () (exchange routing-key mandatory immediate properties body (encoding :utf-8)))
+
+(defun async-test ()
+  (let* ((c (make-async-connection)))
+    (unwind-protect
+         (let ((ch (open-channel c :message-callback (lambda (msg)
+                                                       (log:info "Msg: ~s" (babel:octets-to-string (cl-rabbit:message/body (cl-rabbit:envelope/message msg)))))))
+               (co (open-channel c)))
+           (let ((q (async-queue-declare ch :durable t :exclusive t :auto-delete t)))
+             (async-basic-consume ch q)
+             (async-basic-publish co :routing-key q :body "This is a test message")))
+      #+nil(close-async-connection c))))
