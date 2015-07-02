@@ -64,6 +64,9 @@
             (adjust-array channels (* old-size 2) :initial-element nil)
             old-size)))))
 
+(define-condition stop-connection ()
+  ())
+
 (defun wait-for-frame (async-conn)
   (log:info "Waiting for frame on async connection: ~s" async-conn)
   (with-accessors ((channels async-connection/channels)
@@ -96,9 +99,12 @@
   (let ((size (cffi:foreign-type-size :long-long)))
     (cffi:with-foreign-pointer (buf size)
       (let ((result (iolib.syscalls:read in-fd buf size)))
-        (unless (= result size)
-          (error "Unable to read from pipe"))
-        (cffi:mem-ref buf :long-long)))))
+        (cond ((zerop result)
+               nil)
+              ((= result size)
+               (cffi:mem-ref buf :long-long))
+              (t
+               (error "Unable to read from pipe")))))))
 
 (defun handle-command (async-conn)
   (with-accessors ((b-lock async-connection/b-lock)
@@ -106,35 +112,54 @@
                    (b-current async-connection/b-current))
       async-conn
     (let ((request-index (load-integer-from-fd (async-connection/cmd-fd-reader async-conn))))
-      (bordeaux-threads:with-lock-held (b-lock)
-        (when b-current
-          (error "The current handler index is not NIL: ~s" b-current))
-        (setf b-current request-index)
-        (bordeaux-threads:condition-notify b-condvar)
-        (loop
-           while b-current
-           do (bordeaux-threads:condition-wait b-condvar b-lock))))))
+      (if request-index
+          (bordeaux-threads:with-lock-held (b-lock)
+            (when b-current
+              (error "The current handler index is not NIL: ~s" b-current))
+            (setf b-current request-index)
+            (bordeaux-threads:condition-notify b-condvar)
+            (loop
+               while b-current
+               do (bordeaux-threads:condition-wait b-condvar b-lock)))
+          ;; ELSE: When index is NIL, the connection should be stopped
+          (signal 'stop-connection)))))
 
 (defun run-sync-loop (async-conn)
-  (let* ((conn (async-connection/connection async-conn))
-         (socket-fd (cl-rabbit::get-sockfd conn))
-         (in-fd (async-connection/cmd-fd-reader async-conn))
-         (event-base (make-instance 'iolib:event-base)))
+  (handler-case
+      (let* ((conn (async-connection/connection async-conn))
+             (socket-fd (cl-rabbit::get-sockfd conn))
+             (in-fd (async-connection/cmd-fd-reader async-conn))
+             (event-base (make-instance 'iolib:event-base)))
 
-    (iolib:set-io-handler event-base socket-fd
-                          :read (lambda (fd type c)
-                                  (declare (ignore fd type c))
-                                  (wait-for-frame async-conn)))
-    (iolib:set-io-handler event-base in-fd
-                          :read (lambda (fd type c)
-                                  (declare (ignore fd type c))
-                                  (handle-command async-conn)))
+        (iolib:set-io-handler event-base socket-fd
+                              :read (lambda (fd type c)
+                                      (declare (ignore fd type c))
+                                      (wait-for-frame async-conn)))
+        (iolib:set-io-handler event-base in-fd
+                              :read (lambda (fd type c)
+                                      (declare (ignorable fd type c))
+                                      (log:info "data on in-fd: ~s : ~s : ~s" fd type c)
+                                      (handle-command async-conn)))
+        
+        (iolib:set-error-handler event-base in-fd (lambda (&rest aa) (log:error "Got pipe error: ~s" aa)))
 
-    (loop
-       if (or (cl-rabbit::data-in-buffer conn)
-              (cl-rabbit::frames-enqueued conn))
-       do (wait-for-frame async-conn)
-       else do (iolib:event-dispatch event-base :one-shot t))))
+        (loop
+           if (or (cl-rabbit::data-in-buffer conn)
+                  (cl-rabbit::frames-enqueued conn))
+           do (wait-for-frame async-conn)
+           else do (iolib:event-dispatch event-base :one-shot t)))
+    (stop-connection ()
+      (log:info "Stopping connection")
+      (iolib.syscalls:close (async-connection/cmd-fd-reader async-conn))
+      (loop
+         for channel across (async-connection/channels async-conn)
+         when channel
+         do (loop
+               for callback in (async-channel/close-callbacks channel)
+               do (handler-case
+                      (funcall callback channel)
+                    (error (condition) (log:error "Error while calling close callback: ~a" condition)))))
+      (cl-rabbit:destroy-connection (async-connection/connection async-conn)))))
 
 (defun get-next-b-index (async-conn)
   (bordeaux-threads:with-lock-held ((async-connection/b-lock async-conn))
@@ -185,10 +210,7 @@
   (when (async-connection/close-p async-conn)
     (error "Connection is already closed"))
   (setf (async-connection/close-p async-conn) t)
-  #+nil(sb-posix:close (async-connection/cmd-fd async-conn))
-  #+nil(sb-posix:close (async-connection/cmd-fd-reader async-conn))
-  (with-sync async-conn
-    (cl-rabbit:destroy-connection (async-connection/connection async-conn))))
+  (iolib.syscalls:close (async-connection/cmd-fd async-conn)))
 
 (defun open-channel (async-conn &key message-callback close-callback)
   (with-sync async-conn
@@ -250,5 +272,6 @@
                (co (open-channel c)))
            (let ((q (async-queue-declare ch :durable t :exclusive t :auto-delete t)))
              (async-basic-consume ch q)
-             (async-basic-publish co :routing-key q :body "This is a test message")))
-      #+nil(close-async-connection c))))
+             (async-basic-publish co :routing-key q :body "This is a test message"))
+           (sleep 1))
+      (close-async-connection c))))
