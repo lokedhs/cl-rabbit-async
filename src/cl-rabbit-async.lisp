@@ -27,10 +27,10 @@
                   :reader async-connection/connection)
    (channels      :type vector
                   :initform (make-array (list 10)
-                                        :element-type '(or null async-channel)
-                                        :initial-element nil
-                                        :adjustable t
-                                        :fill-pointer nil)
+                  :element-type '(or null async-channel)
+                  :initial-element nil
+                  :adjustable t
+                  :fill-pointer nil)
                   :reader async-connection/channels)
    (cmd-fd        :type fixnum
                   :accessor async-connection/cmd-fd)
@@ -39,15 +39,18 @@
    (close-p       :type t
                   :initform nil
                   :accessor async-connection/close-p)
-   (requests      :type list
+   (b-current     :type (or null integer)
                   :initform nil
-                  :accessor async-connection/requests)
-   (request-index :type integer
+                  :accessor async-connection/b-current)
+   (b-index       :type integer
                   :initform 0
-                  :accessor async-connection/request-index)
-   (lock          :type t
+                  :accessor async-connection/b-index)
+   (b-lock        :type t
                   :initform (bordeaux-threads:make-lock "Sync connection lock")
-                  :reader async-connection/lock)))
+                  :reader async-connection/b-lock)
+   (b-condvar     :type t
+                  :initform (bordeaux-threads:make-condition-variable :name "Sync connection condvar")
+                  :reader async-connection/b-condvar)))
 
 (defun process-unexpected-frame (conn)
   (simple-wait-frame conn))
@@ -89,23 +92,28 @@
                 ;; ELSE: Message for unused channel
                 (warn-nonexistent-channel))))))))
 
-(defun handle-command (async-conn)
-  (let ((in-fd (async-connection/cmd-fd-reader async-conn))
-        (size (cffi:foreign-type-size :int)))
+(defun load-integer-from-fd (in-fd)
+  (let ((size (cffi:foreign-type-size :int)))
     (cffi:with-foreign-pointer (buf size)
       (let ((result (iolib.syscalls:read in-fd buf size)))
         (unless (= result size)
           (error "Unable to read from pipe"))
-        (let ((index (cffi:mem-ref buf :int)))
-          (let ((cmd (bordeaux-threads:with-lock-held ((async-connection/lock async-conn))
-                       (with-accessors ((requests async-connection/requests)) async-conn
-                         (let ((cmd (assoc index requests)))
-                           (unless cmd
-                             (error "Attempt to get missing command index: ~s" index))
-                           (setf requests (delete (car cmd) requests :key #'car))
-                           (cdr cmd))))))
-            (let ((result (funcall (first cmd))))
-              (funcall (second cmd) result))))))))
+        (cffi:mem-ref buf :int)))))
+
+(defun handle-command (async-conn)
+  (with-accessors ((b-lock async-connection/b-lock)
+                   (b-condvar async-connection/b-condvar)
+                   (b-current async-connection/b-current))
+      async-conn
+    (let ((request-index (load-integer-from-fd (async-connection/cmd-fd-reader async-conn))))
+      (bordeaux-threads:with-lock-held (b-lock)
+        (when b-current
+          (error "The current handler index is not NIL: ~s" b-current))
+        (setf b-current request-index)
+        (bordeaux-threads:condition-notify b-condvar)
+        (loop
+           while b-current
+           do (bordeaux-threads:condition-wait b-condvar b-lock))))))
 
 (defun run-sync-loop (async-conn)
   (let* ((conn (async-connection/connection async-conn))
@@ -128,19 +136,29 @@
        do (wait-for-frame async-conn)
        else do (iolib:event-dispatch event-base :one-shot t))))
 
+(defun get-next-b-index (async-conn)
+  (bordeaux-threads:with-lock-held ((async-connection/b-lock async-conn))
+    (incf (async-connection/b-index async-conn))))
+
 (defun run-in-sync-thread (async-conn fn)
-  (let* ((h (make-transfer-handler))
-         (index (bordeaux-threads:with-lock-held ((async-connection/lock async-conn))
-                  (let ((index (incf (async-connection/request-index async-conn))))
-                    (push (list index fn (lambda (result)
-                                           (set-value h result)))
-                          (async-connection/requests async-conn))
-                    index)))
-         (size (cffi:foreign-type-size :int)))
-    (cffi:with-foreign-pointer (buf size)
-      (setf (cffi:mem-ref buf :int) index)
-      (iolib.syscalls:write (async-connection/cmd-fd async-conn) buf size))
-    (wait-for-value h)))
+  (with-accessors ((b-lock async-connection/b-lock)
+                   (b-condvar async-connection/b-condvar)
+                   (b-current async-connection/b-current))
+      async-conn
+    (let ((request-index (get-next-b-index async-conn))
+          (size (cffi:foreign-type-size :int)))
+      (cffi:with-foreign-pointer (buf size)
+        (setf (cffi:mem-ref buf :int) request-index)
+        (iolib.syscalls:write (async-connection/cmd-fd async-conn) buf size))
+      (bordeaux-threads:with-lock-held (b-lock)
+        (loop
+           until (eql b-current request-index)
+           do (bordeaux-threads:condition-wait b-condvar b-lock)))
+      (unwind-protect
+           (funcall fn)
+        (bordeaux-threads:with-lock-held (b-lock)
+          (setf b-current nil)
+          (bordeaux-threads:condition-notify b-condvar))))))
 
 (defmacro with-sync (conn &body body)
   `(run-in-sync-thread ,conn (lambda () ,@body)))
@@ -225,6 +243,7 @@
 
 (defun async-test ()
   (let* ((c (make-async-connection)))
+    (defparameter *c* c)
     (unwind-protect
          (let ((ch (open-channel c :message-callback (lambda (msg)
                                                        (log:info "Msg: ~s" (babel:octets-to-string (cl-rabbit:message/body (cl-rabbit:envelope/message msg)))))))
