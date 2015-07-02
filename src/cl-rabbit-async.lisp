@@ -93,12 +93,12 @@
                 (warn-nonexistent-channel))))))))
 
 (defun load-integer-from-fd (in-fd)
-  (let ((size (cffi:foreign-type-size :int)))
+  (let ((size (cffi:foreign-type-size :long-long)))
     (cffi:with-foreign-pointer (buf size)
       (let ((result (iolib.syscalls:read in-fd buf size)))
         (unless (= result size)
           (error "Unable to read from pipe"))
-        (cffi:mem-ref buf :int)))))
+        (cffi:mem-ref buf :long-long)))))
 
 (defun handle-command (async-conn)
   (with-accessors ((b-lock async-connection/b-lock)
@@ -146,9 +146,9 @@
                    (b-current async-connection/b-current))
       async-conn
     (let ((request-index (get-next-b-index async-conn))
-          (size (cffi:foreign-type-size :int)))
+          (size (cffi:foreign-type-size :long-long)))
       (cffi:with-foreign-pointer (buf size)
-        (setf (cffi:mem-ref buf :int) request-index)
+        (setf (cffi:mem-ref buf :long-long) request-index)
         (iolib.syscalls:write (async-connection/cmd-fd async-conn) buf size))
       (bordeaux-threads:with-lock-held (b-lock)
         (loop
