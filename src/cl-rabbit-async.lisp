@@ -90,13 +90,13 @@
                 (warn-nonexistent-channel))))))))
 
 (defun handle-command (async-conn)
-  (let ((in-fd (async-connection/cmd-fd-reader async-conn)))
-    (sb-alien:with-alien ((buf (sb-alien:array sb-alien:int 1)))
-      (let* ((size (/ (sb-alien:alien-size sb-alien:int) 8))
-             (result (sb-posix:read in-fd (sb-alien:addr buf) size)))
+  (let ((in-fd (async-connection/cmd-fd-reader async-conn))
+        (size (cffi:foreign-type-size :int)))
+    (cffi:with-foreign-pointer (buf size)
+      (let ((result (iolib.syscalls:read in-fd buf size)))
         (unless (= result size)
           (error "Unable to read from pipe"))
-        (let ((index (sb-alien:deref buf 0)))
+        (let ((index (cffi:mem-ref buf :int)))
           (let ((cmd (bordeaux-threads:with-lock-held ((async-connection/lock async-conn))
                        (with-accessors ((requests async-connection/requests)) async-conn
                          (let ((cmd (assoc index requests)))
@@ -107,35 +107,26 @@
             (let ((result (funcall (first cmd))))
               (funcall (second cmd) result))))))))
 
-(defun wait-select (async-conn)
+(defun run-sync-loop (async-conn)
   (let* ((conn (async-connection/connection async-conn))
          (socket-fd (cl-rabbit::get-sockfd conn))
-         (in-fd (async-connection/cmd-fd-reader async-conn)))
-    (sb-alien:with-alien ((rfds (sb-alien:struct sb-unix:fd-set)))
-      (sb-unix:fd-zero rfds)
-      (locally
-          (declare (optimize (debug 3) (safety 3) (speed 0)))
-        (sb-unix:fd-set socket-fd rfds)
-        (sb-unix:fd-set in-fd rfds))
-      (multiple-value-bind (count err)
-          (sb-unix:unix-fast-select (1+ (max socket-fd in-fd)) (sb-alien:addr rfds) nil nil 10 0)
-        (if count
-            (progn
-              (when (sb-unix:fd-isset in-fd rfds)
-                (handle-command async-conn))
-              (when (sb-unix:fd-isset socket-fd rfds)
-                (wait-for-frame async-conn)))
-            ;; ELSE: An error occurred in the call
-            (unless (= err sb-unix:eintr)
-              (error "Error: ~s" err)))))))
+         (in-fd (async-connection/cmd-fd-reader async-conn))
+         (event-base (make-instance 'iolib:event-base)))
 
-(defun run-sync-loop (async-conn)
-  (let ((conn (async-connection/connection async-conn)))
+    (iolib:set-io-handler event-base socket-fd
+                          :read (lambda (fd type c)
+                                  (declare (ignore fd type c))
+                                  (wait-for-frame async-conn)))
+    (iolib:set-io-handler event-base in-fd
+                          :read (lambda (fd type c)
+                                  (declare (ignore fd type c))
+                                  (handle-command async-conn)))
+
     (loop
        if (or (cl-rabbit::data-in-buffer conn)
               (cl-rabbit::frames-enqueued conn))
        do (wait-for-frame async-conn)
-       else do (wait-select async-conn))))
+       else do (iolib:event-dispatch event-base :one-shot t))))
 
 (defun run-in-sync-thread (async-conn fn)
   (let* ((h (make-transfer-handler))
@@ -144,12 +135,11 @@
                     (push (list index fn (lambda (result)
                                            (set-value h result)))
                           (async-connection/requests async-conn))
-                    index))))
-    (sb-alien:with-alien ((buf (sb-alien:array sb-alien:int 1)))
-      (setf (sb-alien:deref buf 0) index)
-      (sb-posix:write (async-connection/cmd-fd async-conn)
-                      (sb-alien:addr buf)
-                      (/ (sb-alien:alien-size sb-alien:int) 8)))
+                    index)))
+         (size (cffi:foreign-type-size :int)))
+    (cffi:with-foreign-pointer (buf size)
+      (setf (cffi:mem-ref buf :int) index)
+      (iolib.syscalls:write (async-connection/cmd-fd async-conn) buf size))
     (wait-for-value h)))
 
 (defmacro with-sync (conn &body body)
@@ -166,7 +156,7 @@
                                   (log:warn "Reference to RabbitMQ connection object lost. Closing.")
                                   #+nil(cl-rabbit:destroy-connection conn)))
       (multiple-value-bind (in-fd out-fd)
-          (sb-posix:pipe)
+          (iolib.syscalls:pipe)
         (setf (async-connection/cmd-fd conn-wrapper) out-fd)
         (setf (async-connection/cmd-fd-reader conn-wrapper) in-fd)
         (bordeaux-threads:make-thread (lambda () (run-sync-loop conn-wrapper))
@@ -177,8 +167,8 @@
   (when (async-connection/close-p async-conn)
     (error "Connection is already closed"))
   (setf (async-connection/close-p async-conn) t)
-  (sb-posix:close (async-connection/cmd-fd async-conn))
-  (sb-posix:close (async-connection/cmd-fd-reader async-conn))
+  #+nil(sb-posix:close (async-connection/cmd-fd async-conn))
+  #+nil(sb-posix:close (async-connection/cmd-fd-reader async-conn))
   (with-sync async-conn
     (cl-rabbit:destroy-connection (async-connection/connection async-conn))))
 

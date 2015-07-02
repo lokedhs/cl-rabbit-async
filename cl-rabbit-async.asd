@@ -5,7 +5,8 @@
   :description "Experimental async version of cl-rabbit"
   :depends-on (:cl-rabbit
                :log4cl
-               :trivial-garbage)
+               :trivial-garbage
+               :iolib)
   :components ((:module src
                         :serial t
                         :components ((:file "package")
