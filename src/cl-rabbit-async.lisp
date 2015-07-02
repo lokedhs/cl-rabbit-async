@@ -21,6 +21,12 @@
                       :initform nil
                       :accessor async-channel/close-p)))
 
+(defmethod print-object ((obj async-channel) stream)
+  (print-unreadable-object (obj stream :type t :identity t)
+    (format stream "CHANNEL ~a CLOSED ~s"
+            (if (slot-boundp obj 'channel) (slot-value obj 'channel) :not-bound)
+            (if (slot-boundp obj 'close-p) (slot-value obj 'close-p) :not-bound))))
+
 (defclass async-connection ()
   ((connection    :type cl-rabbit::connection
                   :initarg :connection
@@ -68,7 +74,7 @@
   ())
 
 (defun wait-for-frame (async-conn)
-  (log:info "Waiting for frame on async connection: ~s" async-conn)
+  (log:trace "Waiting for frame on async connection: ~s" async-conn)
   (with-accessors ((channels async-connection/channels)
                    (conn async-connection/connection))
       async-conn
@@ -77,7 +83,7 @@
                     (lambda (condition)
                       (when (eq (cl-rabbit:rabbitmq-library-error/error-code condition)
                                 :amqp-unexpected-frame)
-                        (log:info "Got unexpected frame")
+                        (log:trace "Got unexpected frame")
                         (process-unexpected-frame conn)))))
       ;;
       (let ((envelope (cl-rabbit:consume-message conn)))
@@ -88,8 +94,11 @@
             (if (< index (length channels))
                 (let ((async-channel (aref channels index)))
                   (if async-channel
-                      (dolist (callback (async-channel/message-callbacks async-channel))
-                        (funcall callback envelope))
+                      (if (not (async-channel/close-p async-channel))
+                          (dolist (callback (async-channel/message-callbacks async-channel))
+                            (funcall callback envelope))
+                          ;; ELSE: We won't deliver messages to a closed channel
+                          (warn "Incoming message on closed channel: ~s" async-channel))
                       ;; ELSE: Unused channel
                       (warn-nonexistent-channel)))
                 ;; ELSE: Message for unused channel
@@ -112,15 +121,19 @@
                    (b-current async-connection/b-current))
       async-conn
     (let ((request-index (load-integer-from-fd (async-connection/cmd-fd-reader async-conn))))
+      (log:trace "Got request index: ~s" request-index)
       (if request-index
           (bordeaux-threads:with-lock-held (b-lock)
+            (log:trace "Opening gate")
             (when b-current
               (error "The current handler index is not NIL: ~s" b-current))
             (setf b-current request-index)
             (bordeaux-threads:condition-notify b-condvar)
+            (log:trace "Waiting for child to finish processing")
             (loop
                while b-current
-               do (bordeaux-threads:condition-wait b-condvar b-lock)))
+               do (bordeaux-threads:condition-wait b-condvar b-lock))
+            (log:trace "Gate closed"))
           ;; ELSE: When index is NIL, the connection should be stopped
           (signal 'stop-connection)))))
 
@@ -138,7 +151,6 @@
         (iolib:set-io-handler event-base in-fd
                               :read (lambda (fd type c)
                                       (declare (ignorable fd type c))
-                                      (log:info "data on in-fd: ~s : ~s : ~s" fd type c)
                                       (handle-command async-conn)))
         
         (iolib:set-error-handler event-base in-fd (lambda (&rest aa) (log:error "Got pipe error: ~s" aa)))
@@ -148,17 +160,14 @@
                   (cl-rabbit::frames-enqueued conn))
            do (wait-for-frame async-conn)
            else do (iolib:event-dispatch event-base :one-shot t)))
+    ;; Condition handlers
     (stop-connection ()
-      (log:info "Stopping connection")
+      (log:trace "Stopping connection")
       (iolib.syscalls:close (async-connection/cmd-fd-reader async-conn))
       (loop
          for channel across (async-connection/channels async-conn)
-         when channel
-         do (loop
-               for callback in (async-channel/close-callbacks channel)
-               do (handler-case
-                      (funcall callback channel)
-                    (error (condition) (log:error "Error while calling close callback: ~a" condition)))))
+         when (and channel (not (async-channel/close-p channel)))
+         do (call-close-callbacks channel))
       (cl-rabbit:destroy-connection (async-connection/connection async-conn)))))
 
 (defun get-next-b-index (async-conn)
@@ -166,6 +175,8 @@
     (incf (async-connection/b-index async-conn))))
 
 (defun run-in-sync-thread (async-conn fn)
+  (when (async-connection/close-p async-conn)
+    (error "Attempt to run command for closed connection"))
   (with-accessors ((b-lock async-connection/b-lock)
                    (b-condvar async-connection/b-condvar)
                    (b-current async-connection/b-current))
@@ -175,13 +186,18 @@
       (cffi:with-foreign-pointer (buf size)
         (setf (cffi:mem-ref buf :long-long) request-index)
         (iolib.syscalls:write (async-connection/cmd-fd async-conn) buf size))
+      (log:trace "Request index ~s sent to server, waiting for gate to open" request-index)
       (bordeaux-threads:with-lock-held (b-lock)
         (loop
+           do (log:trace "Still waiting for gate to open, current index is: ~s" b-current)
            until (eql b-current request-index)
            do (bordeaux-threads:condition-wait b-condvar b-lock)))
+      (log:trace "Gate opened, proceeding to do stuff")
       (unwind-protect
            (funcall fn)
+        (log:trace "Stuff is done, updating current and notify server that the gate is closed")
         (bordeaux-threads:with-lock-held (b-lock)
+          (log:trace "managed to get lock so that we can notify the server")
           (setf b-current nil)
           (bordeaux-threads:condition-notify b-condvar))))))
 
@@ -217,7 +233,7 @@
     (let* ((index (find-free-channel-index async-conn))
            (channel (1+ index)))
       (cl-rabbit:channel-open (async-connection/connection async-conn) channel)
-      (log:info "Opened channel: ~s" channel)
+      (log:trace "Opened channel: ~s" channel)
       (let ((async-channel (make-instance 'async-channel
                                           :connection async-conn
                                           :channel channel
@@ -226,6 +242,22 @@
         (setf (aref (async-connection/channels async-conn) index) async-channel)
         async-channel))))
 
+(defun call-close-callbacks (async-channel)
+  (dolist (callback (async-channel/close-callbacks async-channel))
+    (handler-case
+        (funcall callback async-channel)
+      (error (condition) (log:error "Error while calling close callback: ~a" condition)))))
+
+(defun mark-channel-as-closed (async-channel)
+  (let ((async-conn (async-channel/connection async-channel)))
+    (setf (async-channel/close-p async-channel) t)
+    (let ((channels (async-connection/channels async-conn))
+          (index (1- (async-channel/channel async-channel))))
+      (assert (not (null (aref channels index))))
+      (setf (aref channels index) nil)))
+  (call-close-callbacks async-channel)
+  (log:trace "Channel marked as closed: ~s" async-channel))
+
 (defun close-channel (async-channel &key code)
   (when (async-channel/close-p async-channel)
     (error "Channel is already closed"))
@@ -233,23 +265,38 @@
     (with-sync async-conn
       (cl-rabbit:channel-close (async-connection/connection async-conn) (async-channel/channel async-channel)
                                :code code)
-      (setf (async-channel/close-p async-channel) t)
-      (let ((channels (async-connection/channels async-conn))
-            (index (1- (async-channel/channel async-channel))))
-        (assert (not (null (aref channels index))))
-        (setf (aref channels index) nil))
+      (mark-channel-as-closed async-channel)
       nil)))
+
+(defun verify-server-error (condition async-channel)
+  (let ((id (cl-rabbit::rabbitmq-server-error/method condition)))
+    (log:trace "Checking error number: ~s" id)
+    (cond ((eql id cl-rabbit::amqp-channel-close-method)
+           #+nil(mark-channel-as-closed async-channel)
+           ;; TODO: We can't reuse this channel unless we're able to
+           ;; send a amqp-channel-close without waiting for a reply,
+           ;; so simply mark the channel but don't remove it from the
+           ;; connection
+           (setf (async-channel/close-p async-channel) t)
+           (call-close-callbacks async-channel)
+           (log:trace "Channel marked as closed, but still remains in channel list"))
+          ((eql id cl-rabbit::amqp-connection-close-method)
+           (error "Async disconnection is not implemented")))))
 
 (defmacro mkwrap (async-name name args keys)
   `(defun ,async-name (async-channel ,@args ,@(if keys `(&key ,@keys) nil))
      (let ((async-conn (async-channel/connection async-channel)))
+       (when (async-channel/close-p async-channel)
+         (error "Attempt to run command for closed channel: ~s" async-channel))
        (with-sync async-conn
-         (,name (async-connection/connection async-conn)
-                (async-channel/channel async-channel)
-                ,@args ,@(mapcan (lambda (key)
-                                   (let ((key-name (if (listp key) (car key) key)))
-                                     (list (intern (symbol-name key-name) "KEYWORD") key-name)))
-                                 keys))))))
+         (handler-bind ((cl-rabbit:rabbitmq-server-error (lambda (condition)
+                                                           (verify-server-error condition async-channel))))
+           (,name (async-connection/connection async-conn)
+                  (async-channel/channel async-channel)
+                  ,@args ,@(mapcan (lambda (key)
+                                     (let ((key-name (if (listp key) (car key) key)))
+                                       (list (intern (symbol-name key-name) "KEYWORD") key-name)))
+                                   keys)))))))
 
 (mkwrap async-exchange-declare cl-rabbit:exchange-declare (exchange type) (passive durable auto-delete internal arguments))
 (mkwrap async-exchange-delete cl-rabbit:exchange-delete (exchange) (if-unused))
@@ -264,14 +311,37 @@
 (mkwrap async-basic-publish cl-rabbit:basic-publish () (exchange routing-key mandatory immediate properties body (encoding :utf-8)))
 
 (defun async-test ()
-  (let* ((c (make-async-connection)))
-    (defparameter *c* c)
-    (unwind-protect
-         (let ((ch (open-channel c :message-callback (lambda (msg)
-                                                       (log:info "Msg: ~s" (babel:octets-to-string (cl-rabbit:message/body (cl-rabbit:envelope/message msg)))))))
-               (co (open-channel c)))
-           (let ((q (async-queue-declare ch :durable t :exclusive t :auto-delete t)))
-             (async-basic-consume ch q)
-             (async-basic-publish co :routing-key q :body "This is a test message"))
-           (sleep 1))
-      (close-async-connection c))))
+  (labels ((msgcb (msg)
+             (log:info "Msg: ~s" (babel:octets-to-string (cl-rabbit:message/body (cl-rabbit:envelope/message msg)))))
+           (closecb (channel)
+             (log:info "Channel closed: ~s" channel))
+           (mkchannel (c)
+             (open-channel c
+                           :message-callback #'msgcb
+                           :close-callback #'closecb)))
+
+    (let* ((c (make-async-connection)))
+      (defparameter *c* c)
+      (unwind-protect
+           (let ((ch (mkchannel c))
+                 (co (open-channel c)))
+             (handler-case
+                 (async-queue-declare ch :queue "palle" :passive t)
+               (cl-rabbit:rabbitmq-server-error (condition)
+                 (log:error "Got error of type: ~s, message: ~a"
+                            (cl-rabbit:rabbitmq-server-error/reply-code condition)
+                            (cl-rabbit:rabbitmq-server-error/message condition))
+                 (when (async-channel/close-p ch)
+                   (setq ch (mkchannel c))
+                   (log:info "Reopened channel: ~s" ch))))
+             (log:info "After error, attempting to declare real queue")
+             (let ((q (async-queue-declare ch :durable t :exclusive t :auto-delete t)))
+               (log:info "Starting consume on input channel")
+               (async-basic-consume ch q)
+               (log:info "Publishing message on output channel")
+               (async-basic-publish co :routing-key q :body "This is a test message"))
+             (log:info "Sleeping 1 second before shutting down")
+             (sleep 1))
+        ;; Unwind form
+        (log:info "Closing connection")
+        (close-async-connection c)))))
