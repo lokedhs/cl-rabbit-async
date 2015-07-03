@@ -205,10 +205,10 @@
     (cl-rabbit:socket-open socket hostname port)
     (cl-rabbit:login-sasl-plain conn vhost user password)
     (let ((conn-wrapper (make-instance 'async-connection :connection conn)))
-      (trivial-garbage:finalize conn-wrapper
-                                (lambda ()
-                                  (log:warn "Reference to RabbitMQ connection object lost. Closing.")
-                                  #+nil(cl-rabbit:destroy-connection conn)))
+      #+nil(trivial-garbage:finalize conn-wrapper
+                                     (lambda ()
+                                       (log:warn "Reference to RabbitMQ connection object lost. Closing.")
+                                       #+nil(cl-rabbit:destroy-connection conn)))
       (multiple-value-bind (in-fd out-fd)
           (iolib.syscalls:pipe)
         (setf (async-connection/cmd-fd conn-wrapper) out-fd)
