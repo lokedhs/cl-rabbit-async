@@ -37,3 +37,30 @@
              (let ((body (cl-rabbit:message/body (cl-rabbit:envelope/message received-message))))
                (fiveam:is (equal (babel:octets-to-string body) message-text)))))
       (close-async-connection conn))))
+
+(fiveam:test close-callback-test
+  (let ((m 10)
+        (lock (bordeaux-threads:make-lock "Channel counter lock"))
+        (opened-channels nil)
+        (failed-count 0)
+        (conn (make-async-connection "localhost")))
+    (unwind-protect
+         (labels ((remove-from-channel-list (channel)
+                    (bordeaux-threads:with-lock-held (lock)
+                      (unless (member channel opened-channels)
+                        (incf failed-count))
+                      (setq opened-channels (remove channel opened-channels))))
+                  (open-and-increment ()
+                    (bordeaux-threads:with-lock-held (lock)
+                      (push (open-channel conn
+                                          :close-callback (lambda (channel)
+                                                            (remove-from-channel-list channel)))
+                            opened-channels))))
+           (loop
+              repeat m
+              do (open-and-increment)))
+      (fiveam:is (eql m (length opened-channels)))
+      (fiveam:is (eql 0 failed-count))
+      (close-async-connection conn)
+      (sleep 1)
+      (fiveam:is (null opened-channels)))))
