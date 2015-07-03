@@ -83,7 +83,7 @@
                     (lambda (condition)
                       (when (eq (cl-rabbit:rabbitmq-library-error/error-code condition)
                                 :amqp-unexpected-frame)
-                        (log:trace "Got unexpected frame")
+                        (log:warn "Got unexpected frame")
                         (process-unexpected-frame conn)))))
       ;;
       (let ((envelope (cl-rabbit:consume-message conn)))
@@ -121,19 +121,15 @@
                    (b-current async-connection/b-current))
       async-conn
     (let ((request-index (load-integer-from-fd (async-connection/cmd-fd-reader async-conn))))
-      (log:trace "Got request index: ~s" request-index)
       (if request-index
           (bordeaux-threads:with-lock-held (b-lock)
-            (log:trace "Opening gate")
             (when b-current
               (error "The current handler index is not NIL: ~s" b-current))
             (setf b-current request-index)
             (bordeaux-threads:condition-notify b-condvar)
-            (log:trace "Waiting for child to finish processing")
             (loop
                while b-current
-               do (bordeaux-threads:condition-wait b-condvar b-lock))
-            (log:trace "Gate closed"))
+               do (bordeaux-threads:condition-wait b-condvar b-lock)))
           ;; ELSE: When index is NIL, the connection should be stopped
           (signal 'stop-connection)))))
 
@@ -155,6 +151,9 @@
         
         (iolib:set-error-handler event-base in-fd (lambda (&rest aa) (log:error "Got pipe error: ~s" aa)))
 
+        ;;
+        ;;  This is the main multiplexer loop
+        ;;
         (loop
            if (or (cl-rabbit::data-in-buffer conn)
                   (cl-rabbit::frames-enqueued conn))
@@ -186,18 +185,13 @@
       (cffi:with-foreign-pointer (buf size)
         (setf (cffi:mem-ref buf :long-long) request-index)
         (iolib.syscalls:write (async-connection/cmd-fd async-conn) buf size))
-      (log:trace "Request index ~s sent to server, waiting for gate to open" request-index)
       (bordeaux-threads:with-lock-held (b-lock)
         (loop
-           do (log:trace "Still waiting for gate to open, current index is: ~s" b-current)
            until (eql b-current request-index)
            do (bordeaux-threads:condition-wait b-condvar b-lock)))
-      (log:trace "Gate opened, proceeding to do stuff")
       (unwind-protect
            (funcall fn)
-        (log:trace "Stuff is done, updating current and notify server that the gate is closed")
         (bordeaux-threads:with-lock-held (b-lock)
-          (log:trace "managed to get lock so that we can notify the server")
           (setf b-current nil)
           (bordeaux-threads:condition-notify b-condvar))))))
 
@@ -255,8 +249,7 @@
           (index (1- (async-channel/channel async-channel))))
       (assert (not (null (aref channels index))))
       (setf (aref channels index) nil)))
-  (call-close-callbacks async-channel)
-  (log:trace "Channel marked as closed: ~s" async-channel))
+  (call-close-callbacks async-channel))
 
 (defun close-channel (async-channel &key code)
   (when (async-channel/close-p async-channel)
@@ -270,14 +263,12 @@
 
 (defun verify-server-error (condition async-channel)
   (let ((id (cl-rabbit::rabbitmq-server-error/method condition)))
-    (log:trace "Checking error number: ~s" id)
     (cond ((eql id cl-rabbit::amqp-channel-close-method)
            (mark-channel-as-closed async-channel)
            (setf (async-channel/close-p async-channel) t)
-           (call-close-callbacks async-channel)
-           (log:trace "Channel marked as closed, but still remains in channel list"))
+           (call-close-callbacks async-channel))
           ((eql id cl-rabbit::amqp-connection-close-method)
-           (error "Async disconnection is not implemented")))))
+           (close-async-connection (async-channel/connection async-channel))))))
 
 (defmacro mkwrap (async-name name args keys)
   `(defun ,async-name (async-channel ,@args ,@(if keys `(&key ,@keys) nil))
