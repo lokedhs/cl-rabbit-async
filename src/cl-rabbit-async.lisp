@@ -272,11 +272,7 @@
   (let ((id (cl-rabbit::rabbitmq-server-error/method condition)))
     (log:trace "Checking error number: ~s" id)
     (cond ((eql id cl-rabbit::amqp-channel-close-method)
-           #+nil(mark-channel-as-closed async-channel)
-           ;; TODO: We can't reuse this channel unless we're able to
-           ;; send a amqp-channel-close without waiting for a reply,
-           ;; so simply mark the channel but don't remove it from the
-           ;; connection
+           (mark-channel-as-closed async-channel)
            (setf (async-channel/close-p async-channel) t)
            (call-close-callbacks async-channel)
            (log:trace "Channel marked as closed, but still remains in channel list"))
