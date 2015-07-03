@@ -198,11 +198,12 @@
 (defmacro with-sync (conn &body body)
   `(run-in-sync-thread ,conn (lambda () ,@body)))
 
-(defun make-async-connection ()
+(defun make-async-connection (hostname &key (port 5672) (user "guest") (password "guest") (vhost "/"))
   (let* ((conn (cl-rabbit:new-connection))
          (socket (cl-rabbit:tcp-socket-new conn)))
-    (cl-rabbit:socket-open socket "localhost" 5672)
-    (cl-rabbit:login-sasl-plain conn "/" "guest" "guest")
+    (check-type hostname string)
+    (cl-rabbit:socket-open socket hostname port)
+    (cl-rabbit:login-sasl-plain conn vhost user password)
     (let ((conn-wrapper (make-instance 'async-connection :connection conn)))
       (trivial-garbage:finalize conn-wrapper
                                 (lambda ()
@@ -307,7 +308,7 @@
                            :message-callback #'msgcb
                            :close-callback #'closecb)))
 
-    (let* ((c (make-async-connection)))
+    (let* ((c (make-async-connection "localhost")))
       (defparameter *c* c)
       (unwind-protect
            (let ((ch (mkchannel c))
