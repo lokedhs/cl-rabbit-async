@@ -21,7 +21,7 @@
                 (c2 (open-channel conn)))
            ;; c1 is the receiver channel
            ;; c2 is the sender channel
-           (async-exchange-declare c1 "foo-ex" "topic" :durable t :auto-delete t)
+           (async-exchange-declare c1 "foo-ex" "topic" :durable t)
            (let ((q (async-queue-declare c1 :exclusive t :auto-delete t)))
              (async-queue-bind c1 :queue q :exchange "foo-ex" :routing-key "#")
              (async-basic-consume c1 q :no-ack t)
