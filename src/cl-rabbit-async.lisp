@@ -39,8 +39,10 @@
                   :fill-pointer nil)
                   :reader async-connection/channels)
    (cmd-fd        :type fixnum
+                  :initarg :cmd-fd
                   :accessor async-connection/cmd-fd)
    (cmd-fd-reader :type fixnum
+                  :initarg :cmd-fd-reader
                   :accessor async-connection/cmd-fd-reader)
    (close-p       :type t
                   :initform nil
@@ -204,15 +206,13 @@
     (check-type hostname string)
     (cl-rabbit:socket-open socket hostname port)
     (cl-rabbit:login-sasl-plain conn vhost user password)
-    (let ((conn-wrapper (make-instance 'async-connection :connection conn)))
-      #+nil(trivial-garbage:finalize conn-wrapper
-                                     (lambda ()
-                                       (log:warn "Reference to RabbitMQ connection object lost. Closing.")
-                                       #+nil(cl-rabbit:destroy-connection conn)))
-      (multiple-value-bind (in-fd out-fd)
-          (iolib.syscalls:pipe)
-        (setf (async-connection/cmd-fd conn-wrapper) out-fd)
-        (setf (async-connection/cmd-fd-reader conn-wrapper) in-fd)
+    (multiple-value-bind (in-fd out-fd)
+        (iolib.syscalls:pipe)
+      (let ((conn-wrapper (make-instance 'async-connection :connection conn :cmd-fd out-fd :cmd-fd-reader in-fd)))
+        (trivial-garbage:finalize conn-wrapper
+                                  (lambda ()
+                                    (log:warn "Reference to RabbitMQ connection object lost. Closing.")
+                                    #+nil(cl-rabbit:destroy-connection conn)))
         (bordeaux-threads:make-thread (lambda () (run-sync-loop conn-wrapper))
                                       :name "RabbitMQ listener")
         conn-wrapper))))
