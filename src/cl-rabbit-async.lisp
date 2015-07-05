@@ -28,37 +28,40 @@
             (if (slot-boundp obj 'close-p) (slot-value obj 'close-p) :not-bound))))
 
 (defclass async-connection ()
-  ((connection    :type cl-rabbit::connection
-                  :initarg :connection
-                  :reader async-connection/connection)
-   (channels      :type vector
-                  :initform (make-array (list 10)
-                  :element-type '(or null async-channel)
-                  :initial-element nil
-                  :adjustable t
-                  :fill-pointer nil)
-                  :reader async-connection/channels)
-   (cmd-fd        :type fixnum
-                  :initarg :cmd-fd
-                  :accessor async-connection/cmd-fd)
-   (cmd-fd-reader :type fixnum
-                  :initarg :cmd-fd-reader
-                  :accessor async-connection/cmd-fd-reader)
-   (close-p       :type t
-                  :initform nil
-                  :accessor async-connection/close-p)
-   (b-current     :type (or null integer)
-                  :initform nil
-                  :accessor async-connection/b-current)
-   (b-index       :type integer
-                  :initform 0
-                  :accessor async-connection/b-index)
-   (b-lock        :type t
-                  :initform (bordeaux-threads:make-lock "Sync connection lock")
-                  :reader async-connection/b-lock)
-   (b-condvar     :type t
-                  :initform (bordeaux-threads:make-condition-variable :name "Sync connection condvar")
-                  :reader async-connection/b-condvar)))
+  ((connection          :type cl-rabbit::connection
+                        :initarg :connection
+                        :reader async-connection/connection)
+   (channels            :type vector
+                        :initform (make-array (list 10)
+                        :element-type '(or null async-channel)
+                        :initial-element nil
+                        :adjustable t
+                        :fill-pointer nil)
+                        :reader async-connection/channels)
+   (num-opened-channels :type dhs-sequences:cas-wrapper
+                        :initform (dhs-sequences:make-cas-wrapper 0)
+                        :reader async-connection/num-opened-channels)
+   (cmd-fd              :type fixnum
+                        :initarg :cmd-fd
+                        :accessor async-connection/cmd-fd)
+   (cmd-fd-reader       :type fixnum
+                        :initarg :cmd-fd-reader
+                        :accessor async-connection/cmd-fd-reader)
+   (close-p             :type t
+                        :initform nil
+                        :accessor async-connection/close-p)
+   (b-current           :type (or null integer)
+                        :initform nil
+                        :accessor async-connection/b-current)
+   (b-index             :type integer
+                        :initform 0
+                        :accessor async-connection/b-index)
+   (b-lock              :type t
+                        :initform (bordeaux-threads:make-lock "Sync connection lock")
+                        :reader async-connection/b-lock)
+   (b-condvar           :type t
+                        :initform (bordeaux-threads:make-condition-variable :name "Sync connection condvar")
+                        :reader async-connection/b-condvar)))
 
 (defun process-unexpected-frame (conn)
   (simple-wait-frame conn))
@@ -235,6 +238,8 @@
                                           :message-callbacks (if message-callback (list message-callback) nil)
                                           :close-callbacks (if close-callback (list close-callback) nil))))
         (setf (aref (async-connection/channels async-conn) index) async-channel)
+        (dhs-sequences:with-cas-update (value (async-connection/num-opened-channels async-conn))
+          (1+ value))
         async-channel))))
 
 (defun call-close-callbacks (async-channel)
@@ -249,7 +254,9 @@
     (let ((channels (async-connection/channels async-conn))
           (index (1- (async-channel/channel async-channel))))
       (assert (not (null (aref channels index))))
-      (setf (aref channels index) nil)))
+      (setf (aref channels index) nil)
+      (dhs-sequences:with-cas-update (value (async-connection/num-opened-channels async-conn))
+        (1- value))))
   (call-close-callbacks async-channel))
 
 (defun close-channel (async-channel &key code)
@@ -270,6 +277,10 @@
            (call-close-callbacks async-channel))
           ((eql id cl-rabbit::amqp-connection-close-method)
            (close-async-connection (async-channel/connection async-channel))))))
+
+(defun num-opened-channels (async-connection)
+  "Returns the number of opened channels."
+  (dhs-sequences:cas-wrapper/value (async-connection/num-opened-channels async-connection)))
 
 (defmacro mkwrap (async-name name args keys)
   `(defun ,async-name (async-channel ,@args ,@(if keys `(&key ,@keys) nil))
@@ -297,39 +308,3 @@
 (mkwrap async-queue-delete cl-rabbit:queue-delete (queue) (if-unused if-empty))
 (mkwrap async-basic-consume cl-rabbit:basic-consume (queue) (consumer-tag no-local no-ack exclusive arguments))
 (mkwrap async-basic-publish cl-rabbit:basic-publish () (exchange routing-key mandatory immediate properties body (encoding :utf-8)))
-
-(defun async-test ()
-  (labels ((msgcb (msg)
-             (log:info "Msg: ~s" (babel:octets-to-string (cl-rabbit:message/body (cl-rabbit:envelope/message msg)))))
-           (closecb (channel)
-             (log:info "Channel closed: ~s" channel))
-           (mkchannel (c)
-             (open-channel c
-                           :message-callback #'msgcb
-                           :close-callback #'closecb)))
-
-    (let* ((c (make-async-connection "localhost")))
-      (defparameter *c* c)
-      (unwind-protect
-           (let ((ch (mkchannel c))
-                 (co (open-channel c)))
-             (handler-case
-                 (async-queue-declare ch :queue "palle" :passive t)
-               (cl-rabbit:rabbitmq-server-error (condition)
-                 (log:error "Got error of type: ~s, message: ~a"
-                            (cl-rabbit:rabbitmq-server-error/reply-code condition)
-                            (cl-rabbit:rabbitmq-server-error/message condition))
-                 (when (async-channel/close-p ch)
-                   (setq ch (mkchannel c))
-                   (log:info "Reopened channel: ~s" ch))))
-             (log:info "After error, attempting to declare real queue")
-             (let ((q (async-queue-declare ch :durable t :exclusive t :auto-delete t)))
-               (log:info "Starting consume on input channel")
-               (async-basic-consume ch q)
-               (log:info "Publishing message on output channel")
-               (async-basic-publish co :routing-key q :body "This is a test message"))
-             (log:info "Sleeping 1 second before shutting down")
-             (sleep 1))
-        ;; Unwind form
-        (log:info "Closing connection")
-        (close-async-connection c)))))

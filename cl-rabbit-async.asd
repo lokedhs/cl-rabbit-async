@@ -6,10 +6,12 @@
   :depends-on (:cl-rabbit
                :log4cl
                :trivial-garbage
-               :iolib)
+               :iolib
+               :containers)
   :components ((:module src
                         :serial t
                         :components ((:file "package")
                                      (:file "misc")
                                      (:file "amqp-misc")
-                                     (:file "cl-rabbit-async")))))
+                                     (:file "cl-rabbit-async")
+                                     (:file "mconnection")))))
