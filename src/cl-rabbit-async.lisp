@@ -212,7 +212,7 @@
     (multiple-value-bind (in-fd out-fd)
         (iolib.syscalls:pipe)
       (let ((conn-wrapper (make-instance 'async-connection :connection conn :cmd-fd out-fd :cmd-fd-reader in-fd)))
-        (trivial-garbage:finalize conn-wrapper
+        #+nil(trivial-garbage:finalize conn-wrapper
                                   (lambda ()
                                     (log:warn "Reference to RabbitMQ connection object lost. Closing.")
                                     #+nil(cl-rabbit:destroy-connection conn)))
