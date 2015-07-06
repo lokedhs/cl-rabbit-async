@@ -17,4 +17,6 @@
            #:async-queue-purge
            #:async-queue-delete
            #:async-basic-consume
-           #:async-basic-publish))
+           #:async-basic-publish
+           #:make-multi-connection
+           #:multi-connection-open-channel))

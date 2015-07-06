@@ -55,4 +55,16 @@
                                                                 :vhost (multi-connection/vhost mconn))))
                                (push conn (multi-connection/connections mconn))
                                (return conn))))))
-      (open-channel conn :message-callback message-callback :close-callback close-callback))))
+      (open-channel conn
+                    :message-callback message-callback
+                    :close-callback (lambda (channel)
+                                      (when close-callback
+                                        (funcall close-callback channel))
+                                      (when (bordeaux-threads:with-lock-held ((multi-connection/lock mconn))
+                                              (if (zerop (num-opened-channels conn))
+                                                  (progn
+                                                    (setf (multi-connection/connections mconn)
+                                                          (remove conn (multi-connection/connections mconn)))
+                                                    t)
+                                                  nil))
+                                        (close-async-connection conn)))))))
