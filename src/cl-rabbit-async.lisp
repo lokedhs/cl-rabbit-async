@@ -131,7 +131,7 @@
             (when b-current
               (error "The current handler index is not NIL: ~s" b-current))
             (setf b-current request-index)
-            (bordeaux-threads:condition-notify b-condvar)
+            (sb-thread:condition-broadcast b-condvar)
             (loop
                while b-current
                do (bordeaux-threads:condition-wait b-condvar b-lock)))
@@ -189,7 +189,9 @@
           (size (cffi:foreign-type-size :long-long)))
       (cffi:with-foreign-pointer (buf size)
         (setf (cffi:mem-ref buf :long-long) request-index)
-        (iolib.syscalls:write (async-connection/cmd-fd async-conn) buf size))
+        (let ((result (iolib.syscalls:write (async-connection/cmd-fd async-conn) buf size)))
+          (unless (eql result size)
+            (error "Error writing to command pipe"))))
       (bordeaux-threads:with-lock-held (b-lock)
         (loop
            until (eql b-current request-index)
@@ -308,3 +310,5 @@
 (mkwrap async-queue-delete cl-rabbit:queue-delete (queue) (if-unused if-empty))
 (mkwrap async-basic-consume cl-rabbit:basic-consume (queue) (consumer-tag no-local no-ack exclusive arguments))
 (mkwrap async-basic-publish cl-rabbit:basic-publish () (exchange routing-key mandatory immediate properties body (encoding :utf-8)))
+(mkwrap async-basic-ack cl-rabbit:basic-ack (delivery-tag) (multiple))
+(mkwrap async-basic-nack cl-rabbit:basic-nack (delivery-tag) (multiple requeue))

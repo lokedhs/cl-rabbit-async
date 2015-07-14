@@ -19,4 +19,6 @@
            #:async-basic-consume
            #:async-basic-publish
            #:make-multi-connection
-           #:multi-connection-open-channel))
+           #:multi-connection-open-channel
+           #:async-basic-ack
+           #:async-basic-nack))

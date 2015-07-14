@@ -2,6 +2,12 @@
 
 (declaim (optimize (speed 0) (safety 3) (debug 3)))
 
+(defun make-random-string (n)
+  (with-output-to-string (s)
+    (loop
+       repeat n
+       do (write-char (code-char (+ (random (1+ (- (char-code #\z) (char-code #\a)))) (char-code #\a))) s))))
+
 (fiveam:test connect-test
   (let ((conn (make-async-connection "localhost")))
     (unwind-protect
@@ -64,3 +70,80 @@
       (close-async-connection conn)
       (sleep 1)
       (fiveam:is (null opened-channels)))))
+
+(fiveam:test parallel-open-test
+  (let ((conn (make-async-connection "localhost")))
+    (unwind-protect
+         (let ((lock (bordeaux-threads:make-lock))
+               (condvar (bordeaux-threads:make-condition-variable))
+               (enabled nil)
+               (num-messages 10)
+               (num-threads 10)
+               (num-received 0)
+               (errors nil))
+
+           (labels ((push-error (msg)
+                      (log:error "~a" msg)
+                      (bordeaux-threads:with-lock-held (lock)
+                        (push msg errors)))
+
+                    (process-queue (q)
+                      (bordeaux-threads:with-lock-held (lock)
+                        (loop
+                           until enabled
+                           do (bordeaux-threads:condition-wait condvar lock)))
+                      (let* ((messages nil)
+                             (consumer-tag (make-random-string 60))
+                             (inner-lock (bordeaux-threads:make-lock))
+                             (inner-condvar (bordeaux-threads:make-condition-variable))
+                             (ch (open-channel conn :message-callback (lambda (msg)
+                                                                        (unless (equal (cl-rabbit:envelope/consumer-tag msg)
+                                                                                       consumer-tag)
+                                                                          (push-error "Consumer tag did not match"))
+                                                                        (bordeaux-threads:with-lock-held (lock)
+                                                                          (incf num-received))
+                                                                        (bordeaux-threads:with-lock-held (inner-lock)
+                                                                          (push msg messages)
+                                                                          (bordeaux-threads:condition-notify inner-condvar))))))
+                        (async-basic-consume ch q :no-ack t :consumer-tag consumer-tag)
+                        (bordeaux-threads:with-lock-held (inner-lock)
+                          (loop
+                             until (= (length messages) num-messages)
+                             do (bordeaux-threads:condition-wait inner-condvar inner-lock))))))
+
+             (let ((ch (open-channel conn)))
+               (async-exchange-declare ch "foo-ex" "topic" :durable t)
+               (let ((queues (loop
+                                repeat num-threads
+                                for q = (async-queue-declare ch :durable nil :auto-delete t :exclusive nil)
+                                do (async-queue-bind ch :queue q :exchange "foo-ex" :routing-key "#")
+                                collect q)))
+                 (log:info "Created queues: ~s" queues)
+                 (let ((threads (loop
+                                   for q in queues
+                                   for i from 0
+                                   collect (let ((queue-copy q))
+                                             (bordeaux-threads:make-thread #'(lambda () (process-queue queue-copy))
+                                                                           :name (format nil "Queue reader ~a, queue: ~a" i q))))))
+                   (sleep 1)
+                   (bordeaux-threads:with-lock-held (lock)
+                     (setq enabled t)
+                     (sb-thread:condition-broadcast condvar))
+                   (log:info "Sending messages")
+                   (loop
+                      repeat num-messages
+                      for i from 0
+                      do (async-basic-publish ch
+                                              :exchange "foo-ex"
+                                              :routing-key "foo"
+                                              :body (format nil "Message number: ~a" i)))
+                   (log:info "Waiting for threads")
+                   (loop
+                      for thread in threads
+                      do (bordeaux-threads:join-thread thread))
+                   (dolist (err errors)
+                     (fiveam:fail err))
+                   (fiveam:is (= (* num-messages num-threads) num-received)))))))
+
+      ;; Unwind form
+      (close-async-connection conn))))
