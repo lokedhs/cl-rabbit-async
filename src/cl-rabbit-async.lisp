@@ -198,7 +198,7 @@
            (funcall fn)
         (bordeaux-threads:with-lock-held (b-lock)
           (setf b-current nil)
-          (bordeaux-threads:condition-notify b-condvar))))))
+          (sb-thread:condition-broadcast b-condvar))))))
 
 (defmacro with-sync (conn &body body)
   `(run-in-sync-thread ,conn (lambda () ,@body)))
