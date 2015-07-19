@@ -167,8 +167,6 @@
         ;; Condition handlers
         (stop-connection ()
           (log:trace "Stopping connection")
-          (iolib:remove-fd-handlers event-base socket-fd :read t)
-          (iolib:remove-fd-handlers event-base in-fd :read t)
           (iolib.syscalls:close (async-connection/cmd-fd-reader async-conn))
           (loop
              for channel across (async-connection/channels async-conn)
