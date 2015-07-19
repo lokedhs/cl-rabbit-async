@@ -103,7 +103,7 @@
                           (dolist (callback (async-channel/message-callbacks async-channel))
                             (funcall callback envelope))
                           ;; ELSE: We won't deliver messages to a closed channel
-                          (warn "Incoming message on closed channel: ~s" async-channel))
+                          (log:warn "Incoming message on closed channel: ~s" async-channel))
                       ;; ELSE: Unused channel
                       (warn-nonexistent-channel)))
                 ;; ELSE: Message for unused channel
@@ -139,40 +139,42 @@
           (signal 'stop-connection)))))
 
 (defun run-sync-loop (async-conn)
-  (handler-case
-      (let* ((conn (async-connection/connection async-conn))
-             (socket-fd (cl-rabbit::get-sockfd conn))
-             (in-fd (async-connection/cmd-fd-reader async-conn))
-             (event-base (make-instance 'iolib:event-base)))
+  (let* ((conn (async-connection/connection async-conn))
+         (socket-fd (cl-rabbit::get-sockfd conn))
+         (in-fd (async-connection/cmd-fd-reader async-conn)))
 
-        (iolib:set-io-handler event-base socket-fd
-                              :read (lambda (fd type c)
-                                      (declare (ignore fd type c))
-                                      (wait-for-frame async-conn)))
-        (iolib:set-io-handler event-base in-fd
-                              :read (lambda (fd type c)
-                                      (declare (ignorable fd type c))
-                                      (handle-command async-conn)))
-        
-        (iolib:set-error-handler event-base in-fd (lambda (&rest aa) (log:error "Got pipe error: ~s" aa)))
+    (iolib:with-event-base (event-base)
+      (iolib:set-io-handler event-base socket-fd
+                            :read (lambda (fd type c)
+                                    (declare (ignore fd type c))
+                                    (wait-for-frame async-conn)))
+      (iolib:set-io-handler event-base in-fd
+                            :read (lambda (fd type c)
+                                    (declare (ignorable fd type c))
+                                    (handle-command async-conn)))
+      
+      (iolib:set-error-handler event-base in-fd (lambda (&rest aa) (log:error "Got pipe error: ~s" aa)))
 
-        ;;
-        ;;  This is the main multiplexer loop
-        ;;
-        (loop
-           if (or (cl-rabbit::data-in-buffer conn)
-                  (cl-rabbit::frames-enqueued conn))
-           do (wait-for-frame async-conn)
-           else do (iolib:event-dispatch event-base :one-shot t)))
-    ;; Condition handlers
-    (stop-connection ()
-      (log:trace "Stopping connection")
-      (iolib.syscalls:close (async-connection/cmd-fd-reader async-conn))
-      (loop
-         for channel across (async-connection/channels async-conn)
-         when (and channel (not (async-channel/close-p channel)))
-         do (call-close-callbacks channel))
-      (cl-rabbit:destroy-connection (async-connection/connection async-conn)))))
+      ;;
+      ;;  This is the main multiplexer loop
+      ;;
+      (handler-case
+          (loop
+             if (or (cl-rabbit::data-in-buffer conn)
+                    (cl-rabbit::frames-enqueued conn))
+             do (wait-for-frame async-conn)
+             else do (iolib:event-dispatch event-base :one-shot t))
+        ;; Condition handlers
+        (stop-connection ()
+          (log:trace "Stopping connection")
+          (iolib:remove-fd-handlers event-base socket-fd :read t)
+          (iolib:remove-fd-handlers event-base in-fd :read t)
+          (iolib.syscalls:close (async-connection/cmd-fd-reader async-conn))
+          (loop
+             for channel across (async-connection/channels async-conn)
+             when (and channel (not (async-channel/close-p channel)))
+             do (call-close-callbacks channel))
+          (cl-rabbit:destroy-connection (async-connection/connection async-conn)))))))
 
 (defun get-next-b-index (async-conn)
   (bordeaux-threads:with-lock-held ((async-connection/b-lock async-conn))
@@ -213,6 +215,7 @@
     (cl-rabbit:login-sasl-plain conn vhost user password)
     (multiple-value-bind (in-fd out-fd)
         (iolib.syscalls:pipe)
+      (log:trace "Opened pipe. in=~a, out=~a" in-fd out-fd)
       (let ((conn-wrapper (make-instance 'async-connection :connection conn :cmd-fd out-fd :cmd-fd-reader in-fd)))
         #+nil(trivial-garbage:finalize conn-wrapper
                                   (lambda ()
