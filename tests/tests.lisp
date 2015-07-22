@@ -128,7 +128,7 @@
                    (sleep 1)
                    (bordeaux-threads:with-lock-held (lock)
                      (setq enabled t)
-                     (condition-broadcast condvar))
+                     (cl-rabbit-async::condition-broadcast condvar))
                    (log:info "Sending messages")
                    (loop
                       repeat num-messages
