@@ -42,3 +42,11 @@
       (setf value-p t)
       (bordeaux-threads:condition-notify (transfer-handler/condvar h))
       new-value)))
+
+(defun condition-broadcast (condvar)
+  #+sbcl
+  (sb-thread:condition-broadcast condvar)
+  #+abcl
+  (threads:object-notify-all condvar)
+  #-(or sbcl abcl)
+  (error "Condition broadcast not implemented"))

@@ -131,7 +131,7 @@
             (when b-current
               (error "The current handler index is not NIL: ~s" b-current))
             (setf b-current request-index)
-            (sb-thread:condition-broadcast b-condvar)
+            (condition-broadcast b-condvar)
             (loop
                while b-current
                do (bordeaux-threads:condition-wait b-condvar b-lock)))
@@ -200,7 +200,7 @@
            (funcall fn)
         (bordeaux-threads:with-lock-held (b-lock)
           (setf b-current nil)
-          (sb-thread:condition-broadcast b-condvar))))))
+          (condition-broadcast b-condvar))))))
 
 (defmacro with-sync (conn &body body)
   `(run-in-sync-thread ,conn (lambda () ,@body)))
