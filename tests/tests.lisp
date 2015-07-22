@@ -128,7 +128,7 @@
                    (sleep 1)
                    (bordeaux-threads:with-lock-held (lock)
                      (setq enabled t)
-                     (sb-thread:condition-broadcast condvar))
+                     (condition-broadcast condvar))
                    (log:info "Sending messages")
                    (loop
                       repeat num-messages

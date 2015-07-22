@@ -47,6 +47,7 @@
   #+sbcl
   (sb-thread:condition-broadcast condvar)
   #+abcl
-  (threads:object-notify-all condvar)
+  (threads:synchronized-on condvar
+    (threads:object-notify-all condvar))
   #-(or sbcl abcl)
   (error "Condition broadcast not implemented"))
