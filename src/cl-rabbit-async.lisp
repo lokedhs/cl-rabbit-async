@@ -274,11 +274,11 @@
 
 (defun verify-server-error (condition async-channel)
   (let ((id (cl-rabbit::rabbitmq-server-error/method condition)))
-    (cond ((eql id cl-rabbit::amqp-channel-close-method)
+    (cond ((eql id cl-rabbit::+amqp-channel-close-method+)
            (mark-channel-as-closed async-channel)
            (setf (async-channel/close-p async-channel) t)
            (call-close-callbacks async-channel))
-          ((eql id cl-rabbit::amqp-connection-close-method)
+          ((eql id cl-rabbit::+amqp-connection-close-method+)
            (close-async-connection (async-channel/connection async-channel))))))
 
 (defun num-opened-channels (async-connection)
