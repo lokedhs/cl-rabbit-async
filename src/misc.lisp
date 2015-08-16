@@ -49,5 +49,9 @@
   #+abcl
   (threads:synchronized-on condvar
     (threads:object-notify-all condvar))
-  #-(or sbcl abcl)
+  ;; The CCL implementation of condition variables are implemented
+  ;; using semaphores, so all notifications are already sent to all listeners.
+  #+ccl
+  (bordeaux-threads:condition-notify condvar)
+  #-(or sbcl abcl ccl)
   (error "Condition broadcast not implemented"))
