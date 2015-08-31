@@ -256,7 +256,7 @@
     (setf (async-channel/close-p async-channel) t)
     (let ((channels (async-connection/channels async-conn))
           (index (1- (async-channel/channel async-channel))))
-      (assert (not (null (aref channels index))))
+      (assert (eq (aref channels index) async-channel))
       (setf (aref channels index) nil)
       (dhs-sequences:with-cas-update (value (async-connection/num-opened-channels async-conn))
         (1- value))))
