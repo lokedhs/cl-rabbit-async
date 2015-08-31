@@ -221,7 +221,6 @@
         conn-wrapper))))
 
 (defun close-async-connection (async-conn)
-  (log:info "CLOSING:~s" async-conn)
   (when (async-connection/close-p async-conn)
     (error "Connection is already closed"))
   (setf (async-connection/close-p async-conn) t)
