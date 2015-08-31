@@ -38,9 +38,6 @@
                         :adjustable t
                         :fill-pointer nil)
                         :reader async-connection/channels)
-   (num-opened-channels :type dhs-sequences:cas-wrapper
-                        :initform (dhs-sequences:make-cas-wrapper 0)
-                        :reader async-connection/num-opened-channels)
    (cmd-fd              :type fixnum
                         :initarg :cmd-fd
                         :accessor async-connection/cmd-fd)
@@ -224,6 +221,7 @@
         conn-wrapper))))
 
 (defun close-async-connection (async-conn)
+  (log:info "CLOSING:~s" async-conn)
   (when (async-connection/close-p async-conn)
     (error "Connection is already closed"))
   (setf (async-connection/close-p async-conn) t)
@@ -241,8 +239,6 @@
                                           :message-callbacks (if message-callback (list message-callback) nil)
                                           :close-callbacks (if close-callback (list close-callback) nil))))
         (setf (aref (async-connection/channels async-conn) index) async-channel)
-        (dhs-sequences:with-cas-update (value (async-connection/num-opened-channels async-conn))
-          (1+ value))
         async-channel))))
 
 (defun call-close-callbacks (async-channel)
@@ -257,9 +253,7 @@
     (let ((channels (async-connection/channels async-conn))
           (index (1- (async-channel/channel async-channel))))
       (assert (eq (aref channels index) async-channel))
-      (setf (aref channels index) nil)
-      (dhs-sequences:with-cas-update (value (async-connection/num-opened-channels async-conn))
-        (1- value))))
+      (setf (aref channels index) nil)))
   (call-close-callbacks async-channel))
 
 (defun close-channel (async-channel &key code)
@@ -283,7 +277,10 @@
 
 (defun num-opened-channels (async-connection)
   "Returns the number of opened channels."
-  (dhs-sequences:cas-wrapper/value (async-connection/num-opened-channels async-connection)))
+  (bordeaux-threads:with-lock-held ((async-connection/b-lock async-connection))
+    (loop
+       for v across (async-connection/channels async-connection)
+       summing (if v 1 0))))
 
 (defmacro mkwrap (async-name name args keys)
   `(defun ,async-name (async-channel ,@args ,@(if keys `(&key ,@keys) nil))

@@ -21,4 +21,5 @@
            #:make-multi-connection
            #:multi-connection-open-channel
            #:async-basic-ack
-           #:async-basic-nack))
+           #:async-basic-nack
+           #:close-multi-connection))

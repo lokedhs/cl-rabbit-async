@@ -4,7 +4,8 @@
   :license "MIT"
   :description "Fiveam testcases for cl-rabbit-async"
   :depends-on (:cl-rabbit-async
-               :fiveam)
+               :fiveam
+               :trivial-backtrace)
   :components ((:module tests
                         :serial t
                         :components ((:file "package")

@@ -10,11 +10,13 @@
 
 (defmacro with-async-connection (conn &body body)
   (let ((conn-sym (gensym "CONN-")))
-    `(let ((,conn-sym (make-async-connection "localhost")))
+    `(let ((,conn-sym (make-multi-connection "localhost" :max-channels 10)))
        (unwind-protect
             (let ((,conn ,conn-sym))
               ,@body)
-         (close-async-connection ,conn-sym)))))
+        (progn
+          (log:info "Closing mconn: ~s" ',conn)
+          (close-multi-connection ,conn-sym))))))
 
 (fiveam:test connect-test
   (let ((conn (make-async-connection "localhost")))
@@ -111,7 +113,7 @@
                                                                         (bordeaux-threads:with-lock-held (lock)
                                                                           (incf num-received))
                                                                         (bordeaux-threads:with-lock-held (inner-lock)
-zz                                                                          (push msg messages)
+                                                                          (push msg messages)
                                                                           (bordeaux-threads:condition-notify inner-condvar))))))
                         (async-basic-consume ch q :no-ack t :consumer-tag consumer-tag)
                         (bordeaux-threads:with-lock-held (inner-lock)
@@ -139,8 +141,7 @@ zz                                                                          (pus
                      (cl-rabbit-async::condition-broadcast condvar))
                    (log:info "Sending messages")
                    (loop
-                      repeat num-messages
-                      for i from 0
+                      for i from 0 below num-messages
                       do (async-basic-publish ch
                                               :exchange "foo-ex"
                                               :routing-key "foo"
@@ -159,12 +160,17 @@ zz                                                                          (pus
 (fiveam:test open-close-test
   (let ((lock (bordeaux-threads:make-lock))
         (stopped nil)
-        (num-readers 1)
-        (errors nil))
+        (num-readers 10)
+        (errors nil)
+        (recv-count 0))
     (with-async-connection conn
-      (labels ((push-error (message condition)
+      (labels ((push-error (message &optional condition)
                  (bordeaux-threads:with-lock-held (lock)
-                   (push (format nil "Error: ~a: ~a" message condition) errors)))
+                   (let ((text (if condition
+                                   (format nil "Error: ~a: ~a" message condition)
+                                   (format nil "Error: ~a" message))))
+                     (log:error "~a" text)
+                     (push text errors))))
 
                (stopped-p ()
                  (bordeaux-threads:with-lock-held (lock)
@@ -172,7 +178,7 @@ zz                                                                          (pus
 
                (provider-loop ()
                  (with-async-connection provider-conn
-                   (let ((channel (open-channel provider-conn)))
+                   (let ((channel (multi-connection-open-channel provider-conn)))
                      (loop
                         for i from 0
                         until (stopped-p)
@@ -186,10 +192,18 @@ zz                                                                          (pus
                                                                       i reader-index)))
                              (sleep 1/10))))))
 
+               (new-msg (msg ctag)
+                 (cond ((null ctag)
+                        (push-error "Null ctag"))
+                       ((not (equal (cl-rabbit:envelope/consumer-tag msg) ctag))
+                        (push-error (format nil "Unexpected ctag, got: ~a, expected: ~a"
+                                            (cl-rabbit:envelope/consumer-tag msg) ctag)))
+                       (t
+                        (bordeaux-threads:with-lock-held (lock)
+                          (incf recv-count)))))
+
                (reader-loop (reader-index)
-                 (let ((queue (let* ((channel (open-channel conn :message-callback (lambda (msg)
-                                                                                     (log:info "got msg: ~s"
-                                                                                               (cl-rabbit:envelope/consumer-tag msg)))))
+                 (let ((queue (let* ((channel (multi-connection-open-channel conn))
                                      (q (async-queue-declare channel :durable t :arguments '(("x-expires" . 5000)))))
                                 (async-queue-bind channel
                                                   :queue q
@@ -199,13 +213,19 @@ zz                                                                          (pus
                                 q)))
                    (loop
                       until (stopped-p)
-                      do (let* ((channel (open-channel conn))
-                                (consumer-tag (async-basic-consume channel queue :no-ack nil)))
-                           (log:info "Started listening with consumer-tag: ~a" consumer-tag)
+                      do (let* ((ctag nil)
+                                (reader-lock (bordeaux-threads:make-lock))
+                                (channel (multi-connection-open-channel conn :message-callback (lambda (msg)
+                                                                                                 (let ((consumer-tag (bordeaux-threads:with-lock-held (reader-lock)
+                                                                                                                       ctag)))
+                                                                                                   (new-msg msg consumer-tag))))))
+                           (bordeaux-threads:with-lock-held (reader-lock)
+                             (let ((consumer-tag (async-basic-consume channel queue :no-ack t)))
+                               (setf ctag consumer-tag)))
                            (sleep 1)
                            (close-channel channel))))))
 
-        (let ((channel (open-channel conn)))
+        (let ((channel (multi-connection-open-channel conn)))
           (async-exchange-declare channel "foo-ex" "topic" :durable t)
           (close-channel channel))
 
@@ -217,14 +237,47 @@ zz                                                                          (pus
               (threads (loop
                           for reader-index from 0 below num-readers
                           collect (bordeaux-threads:make-thread (lambda ()
-                                                                  (handler-case
-                                                                      (reader-loop reader-index)
-                                                                    (error (condition)
-                                                                      (push-error (format nil "Reader ~a" reader-index)
-                                                                                  condition))))))))
+                                                                  (block read-loop-handler
+                                                                   (handler-bind ((error (lambda (condition)
+                                                                                           (push-error (format nil "Reader ~a: ~a" reader-index
+                                                                                                               condition))
+                                                                                           (return-from read-loop-handler nil))))
+                                                                     (reader-loop reader-index))))))))
           (sleep 20)
           (bordeaux-threads:with-lock-held (lock)
             (setq stopped t))
           (bordeaux-threads:join-thread provider-thread)
           (mapc #'bordeaux-threads:join-thread threads)
+          (log:info "recv-count: ~a" recv-count)
           (fiveam:is (null errors)))))))
+
+(defun num-conn-channels (mconn)
+  (loop
+     for conn in (cl-rabbit-async::multi-connection/connections mconn)
+     summing (cl-rabbit-async::num-opened-channels (cl-rabbit-async::mconnection-wrapper/connection conn))))
+
+(fiveam:test multi-conn-test
+  (with-async-connection conn
+    (labels ((open-channels (n)
+               (loop
+                  for i from 1 to n
+                  collect (multi-connection-open-channel conn)
+                  do (fiveam:is (= i (num-conn-channels conn)))))
+             (close-channels (channels n)
+               (let ((total-channel-count (length channels)))
+                 (when (< total-channel-count n)
+                   (error "Attempt to close more channels than were opened"))
+                 (loop
+                    with num-channels = total-channel-count
+                    repeat n
+                    for ch in channels
+                    do (progn
+                         (close-channel ch)
+                         (decf num-channels)
+                         (fiveam:is (= num-channels (num-conn-channels conn))))))))
+      (let ((channels (open-channels 20)))
+        (close-channels channels (length channels)))
+      (loop
+         repeat 20
+         do (let ((channels (open-channels 1)))
+              (close-channels channels 1))))))
