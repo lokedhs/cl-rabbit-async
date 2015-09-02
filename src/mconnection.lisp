@@ -79,6 +79,7 @@
                                                                  :vhost (multi-connection/vhost mconn)))
                                     (wrapper (make-instance 'mconnection-wrapper :connection conn)))
                                (push wrapper (multi-connection/connections mconn))
+                               (incf (mconnection-wrapper/in-progress wrapper))
                                (return wrapper))))))
       (unwind-protect
            (open-channel (mconnection-wrapper/connection conn)
