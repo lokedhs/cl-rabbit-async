@@ -75,6 +75,8 @@
 (define-condition stop-connection ()
   ())
 
+(defvar *in-async-handler* nil)
+
 (defun wait-for-frame (async-conn)
   (log:trace "Waiting for frame on async connection: ~s" async-conn)
   (with-accessors ((channels async-connection/channels)
@@ -98,7 +100,8 @@
                   (if async-channel
                       (if (not (async-channel/close-p async-channel))
                           (dolist (callback (async-channel/message-callbacks async-channel))
-                            (funcall callback envelope))
+                            (let ((*in-async-handler* t))
+                              (funcall callback envelope)))
                           ;; ELSE: We won't deliver messages to a closed channel
                           (log:warn "Incoming message on closed channel: ~s" async-channel))
                       ;; ELSE: Unused channel
@@ -149,7 +152,7 @@
                             :read (lambda (fd type c)
                                     (declare (ignorable fd type c))
                                     (handle-command async-conn)))
-      
+
       (iolib:set-error-handler event-base in-fd (lambda (&rest aa) (log:error "Got pipe error: ~s" aa)))
 
       ;;
@@ -194,7 +197,8 @@
            until (eql b-current request-index)
            do (bordeaux-threads:condition-wait b-condvar b-lock)))
       (unwind-protect
-           (funcall fn)
+           (let ((*in-async-handler* t))
+             (funcall fn))
         (bordeaux-threads:with-lock-held (b-lock)
           (setf b-current nil)
           (condition-broadcast b-condvar))))))
@@ -282,19 +286,25 @@
        summing (if v 1 0))))
 
 (defmacro mkwrap (async-name name args keys)
-  `(defun ,async-name (async-channel ,@args ,@(if keys `(&key ,@keys) nil))
-     (let ((async-conn (async-channel/connection async-channel)))
-       (when (async-channel/close-p async-channel)
-         (error "Attempt to run command for closed channel: ~s" async-channel))
-       (with-sync async-conn
-         (handler-bind ((cl-rabbit:rabbitmq-server-error (lambda (condition)
-                                                           (verify-server-error condition async-channel))))
-           (,name (async-connection/connection async-conn)
-                  (async-channel/channel async-channel)
-                  ,@args ,@(mapcan (lambda (key)
-                                     (let ((key-name (if (listp key) (car key) key)))
-                                       (list (intern (symbol-name key-name) "KEYWORD") key-name)))
-                                   keys)))))))
+  (let ((async-sym (gensym)))
+    `(defun ,async-name (async-channel ,@args ,@(if keys `(&key ,@keys) nil))
+       (check-type async-channel async-channel)
+       (let ((async-conn (async-channel/connection async-channel)))
+         (when (async-channel/close-p async-channel)
+           (error "Attempt to run command for closed channel: ~s" async-channel))
+         (labels ((,async-sym ()
+                    (handler-bind ((cl-rabbit:rabbitmq-server-error (lambda (condition)
+                                                                      (verify-server-error condition async-channel))))
+                      (,name (async-connection/connection async-conn)
+                             (async-channel/channel async-channel)
+                             ,@args ,@(mapcan (lambda (key)
+                                                (let ((key-name (if (listp key) (car key) key)))
+                                                  (list (intern (symbol-name key-name) "KEYWORD") key-name)))
+                                              keys)))))
+           (if *in-async-handler*
+               (,async-sym)
+               (with-sync async-conn
+                 (,async-sym))))))))
 
 (mkwrap async-exchange-declare cl-rabbit:exchange-declare (exchange type) (passive durable auto-delete internal arguments))
 (mkwrap async-exchange-delete cl-rabbit:exchange-delete (exchange) (if-unused))
