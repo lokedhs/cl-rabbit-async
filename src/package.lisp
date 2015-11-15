@@ -22,4 +22,7 @@
            #:multi-connection-open-channel
            #:async-basic-ack
            #:async-basic-nack
-           #:close-multi-connection))
+           #:close-multi-connection
+           #:async-tx-select
+           #:async-tx-commit
+           #:async-tx-rollback))

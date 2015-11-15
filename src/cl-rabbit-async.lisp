@@ -319,3 +319,6 @@
 (mkwrap async-basic-publish cl-rabbit:basic-publish () (exchange routing-key mandatory immediate properties body (encoding :utf-8)))
 (mkwrap async-basic-ack cl-rabbit:basic-ack (delivery-tag) (multiple))
 (mkwrap async-basic-nack cl-rabbit:basic-nack (delivery-tag) (multiple requeue))
+(mkwrap async-tx-select cl-rabbit:tx-select () ())
+(mkwrap async-tx-commit cl-rabbit:tx-commit () ())
+(mkwrap async-tx-rollback cl-rabbit:tx-rollback () ())

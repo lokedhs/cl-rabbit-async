@@ -15,7 +15,7 @@
             (let ((,conn ,conn-sym))
               ,@body)
         (progn
-          (log:info "Closing mconn: ~s" ',conn)
+          (log:debug "Closing mconn: ~s" ',conn)
           (close-multi-connection ,conn-sym))))))
 
 (fiveam:test connect-test
@@ -128,7 +128,7 @@
                                 for q = (async-queue-declare ch :durable nil :auto-delete t :exclusive nil)
                                 do (async-queue-bind ch :queue q :exchange "foo-ex" :routing-key "#")
                                 collect q)))
-                 (log:info "Created queues: ~s" queues)
+                 (log:debug "Created queues: ~s" queues)
                  (let ((threads (loop
                                    for q in queues
                                    for i from 0
@@ -139,14 +139,14 @@
                    (bordeaux-threads:with-lock-held (lock)
                      (setq enabled t)
                      (cl-rabbit-async::condition-broadcast condvar))
-                   (log:info "Sending messages")
+                   (log:debug "Sending messages")
                    (loop
                       for i from 0 below num-messages
                       do (async-basic-publish ch
                                               :exchange "foo-ex"
                                               :routing-key "foo"
                                               :body (format nil "Message number: ~a" i)))
-                   (log:info "Waiting for threads")
+                   (log:debug "Waiting for threads")
                    (loop
                       for thread in threads
                       do (bordeaux-threads:join-thread thread))
@@ -248,7 +248,7 @@
             (setq stopped t))
           (bordeaux-threads:join-thread provider-thread)
           (mapc #'bordeaux-threads:join-thread threads)
-          (log:info "recv-count: ~a" recv-count)
+          (log:debug "recv-count: ~a" recv-count)
           (fiveam:is (null errors)))))))
 
 (defun num-conn-channels (mconn)
