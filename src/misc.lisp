@@ -53,5 +53,7 @@
   ;; using semaphores, so all notifications are already sent to all listeners.
   #+ccl
   (bordeaux-threads:condition-notify condvar)
-  #-(or sbcl abcl ccl)
+  #+clisp
+  (mt:exemption-broadcast condvar)
+  #-(or sbcl abcl ccl clisp)
   (error "Condition broadcast not implemented"))
