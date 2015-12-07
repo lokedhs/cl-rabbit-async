@@ -105,3 +105,15 @@
     (when result
       (dolist (conn (multi-connection/connections mconn))
         (close-async-connection (mconnection-wrapper/connection conn))))))
+
+(defmacro with-multi-connection ((conn mconn &key message-callback close-callback) &body body)
+  (let ((sym (gensym))
+        (mconn-sym (gensym)))
+    `(let* ((,mconn-sym ,mconn)
+            (,sym (multi-connection-open-channel ,mconn-sym
+                                                 :message-callback ,message-callback
+                                                 :close-callback ,close-callback)))
+       (unwind-protect
+            (let ((,conn ,sym))
+              ,@body)
+         (close-multi-connection ,mconn-sym)))))
