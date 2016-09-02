@@ -7,7 +7,7 @@
                :log4cl
                :trivial-garbage
                :iolib
-               :containers)
+               :receptacle)
   :components ((:module src
                         :serial t
                         :components ((:file "package")
